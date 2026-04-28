@@ -12,15 +12,24 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 public final class OpenAiBridge {
 
     private static final ObjectMapper objectMapper = new ObjectMapper();
+    private static final boolean DEBUG = Boolean.parseBoolean(System.getProperty("QODER_DEBUG", "false"));
+    private static final boolean STRIP_BASE_SYSTEM = Boolean.parseBoolean(System.getProperty("QODER_STRIP_BASE_SYSTEM", "true"));
+    private static final int DEBUG_MAX_CHARS = Integer.parseInt(System.getProperty("QODER_DEBUG_MAX_CHARS", "12000"));
+    private static final int DEBUG_SSE_LINES = Integer.parseInt(System.getProperty("QODER_DEBUG_SSE_LINES", "20"));
     private final BearerBuilder.SessionContext sess;
     private final BearerApiClient bearerClient;
     private final JsonNode templateBase;
+
+    private record QoderDelta(String content, JsonNode toolCalls, String finishReason) {}
 
     public OpenAiBridge(String pat) throws Exception {
         String mid = UUID.randomUUID().toString();
@@ -39,6 +48,7 @@ public final class OpenAiBridge {
         basePrompt = basePrompt.replace("{UUID4}",UUID.randomUUID().toString());
         basePrompt = basePrompt.replace("{UUID5}",UUID.randomUUID().toString());
         basePrompt = basePrompt.replace("{TIME1}",String.valueOf(System.currentTimeMillis()));
+        basePrompt = basePrompt.replace("D:/Projects/Qoder", System.getProperty("user.dir").replace("\\", "/"));
         this.templateBase = objectMapper.readTree(basePrompt);
     }
 
@@ -59,6 +69,8 @@ public final class OpenAiBridge {
             boolean stream = req.path("stream").asBoolean(false);
             String model = req.path("model").asText("lite");
             JsonNode messages = req.path("messages");
+            logOpenAiRequest(req, model, stream, messages);
+            Set<String> availableTools = collectToolNames(req.path("tools"));
 
             ObjectNode body = templateBase.deepCopy();
             String nid = UUID.randomUUID().toString();
@@ -74,15 +86,7 @@ public final class OpenAiBridge {
             biz.put("id", UUID.randomUUID().toString());
             biz.put("begin_at", System.currentTimeMillis());
 
-            String prompt = "";
-            for (int i = messages.size() - 1; i >= 0; i--) {
-                JsonNode m = messages.get(i);
-                if ("user".equals(m.path("role").asText())) {
-                    JsonNode c = m.path("content");
-                    prompt = c.isTextual() ? c.asText() : c.toString();
-                    break;
-                }
-            }
+            String prompt = buildPrompt(messages);
             ObjectNode ctx = (ObjectNode) body.path("chat_context");
             ((ObjectNode) ctx.path("text")).put("text", prompt);
             ((ObjectNode) ctx.path("extra").path("originalContent")).put("text", prompt);
@@ -90,7 +94,8 @@ public final class OpenAiBridge {
             ArrayNode msgsArr = (ArrayNode) body.path("messages");
             ArrayNode rebuilt = objectMapper.createArrayNode();
             for (JsonNode msg : msgsArr) {
-                if (!"user".equals(msg.path("role").asText())) {
+                String role = msg.path("role").asText("");
+                if (!"user".equals(role) && !(STRIP_BASE_SYSTEM && "system".equals(role))) {
                     rebuilt.add(msg);
                 }
             }
@@ -129,29 +134,56 @@ public final class OpenAiBridge {
                 ex.getResponseHeaders().add("Cache-Control", "no-cache");
                 ex.sendResponseHeaders(200, 0);
                 OutputStream out = ex.getResponseBody();
+                int[] sseLineNo = {0};
+                boolean[] sawToolCalls = {false};
+                String[] finishReason = {"stop"};
                 bearerClient.openStreamLines(url, body, extraHeaders, line -> {
                     if (!line.startsWith("data:")) return;
-                    String content = extractContent(line.substring(5).trim());
-                    if (content == null || content.isEmpty()) return;
+                    String data = line.substring(5).trim();
+                    logQoderSseData(data, ++sseLineNo[0]);
+                    QoderDelta delta = extractDelta(data);
+                    if (delta == null) return;
+                    if (delta.finishReason() != null && !delta.finishReason().isEmpty()) {
+                        finishReason[0] = delta.finishReason();
+                    }
+                    boolean hasContent = delta.content() != null && !delta.content().isEmpty();
+                    boolean hasToolCalls = delta.toolCalls() != null && delta.toolCalls().isArray() && delta.toolCalls().size() > 0;
+                    if (!hasContent && !hasToolCalls) return;
                     try {
                         ObjectNode chunk = makeChunk(reqId, created, model);
-                        ((ObjectNode) chunk.path("choices").get(0).path("delta")).put("role", "assistant").put("content", content);
+                        ObjectNode outDelta = (ObjectNode) chunk.path("choices").get(0).path("delta");
+                        outDelta.put("role", "assistant");
+                        if (hasContent) outDelta.put("content", delta.content());
+                        if (hasToolCalls) {
+                            sawToolCalls[0] = true;
+                            outDelta.set("tool_calls", normalizeToolCalls(delta.toolCalls(), availableTools));
+                        }
                         out.write(("data: " + objectMapper.writeValueAsString(chunk) + "\n\n").getBytes(StandardCharsets.UTF_8));
                         out.flush();
                     } catch (IOException ie) { throw new RuntimeException(ie); }
                 });
                 ObjectNode done = makeChunk(reqId, created, model);
-                ((ObjectNode) done.path("choices").get(0)).put("finish_reason", "stop");
+                ((ObjectNode) done.path("choices").get(0)).put("finish_reason", sawToolCalls[0] ? "tool_calls" : finishReason[0]);
                 ((ObjectNode) done.path("choices").get(0)).set("delta", objectMapper.createObjectNode());
                 out.write(("data: " + objectMapper.writeValueAsString(done) + "\n\n").getBytes(StandardCharsets.UTF_8));
                 out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
                 out.close();
             } else {
                 StringBuilder full = new StringBuilder();
+                Map<Integer, ObjectNode> toolCalls = new LinkedHashMap<>();
+                String[] finishReason = {"stop"};
+                int[] sseLineNo = {0};
                 bearerClient.openStreamLines(url, body, extraHeaders, line -> {
                     if (!line.startsWith("data:")) return;
-                    String content = extractContent(line.substring(5).trim());
-                    if (content != null) full.append(content);
+                    String data = line.substring(5).trim();
+                    logQoderSseData(data, ++sseLineNo[0]);
+                    QoderDelta delta = extractDelta(data);
+                    if (delta == null) return;
+                    if (delta.content() != null) full.append(delta.content());
+                    if (delta.toolCalls() != null) appendToolCalls(toolCalls, delta.toolCalls(), availableTools);
+                    if (delta.finishReason() != null && !delta.finishReason().isEmpty()) {
+                        finishReason[0] = delta.finishReason();
+                    }
                 });
                 ObjectNode out = objectMapper.createObjectNode();
                 out.put("id", reqId); out.put("object", "chat.completion");
@@ -160,9 +192,19 @@ public final class OpenAiBridge {
                 ObjectNode ch = objectMapper.createObjectNode();
                 ch.put("index", 0);
                 ObjectNode msg = objectMapper.createObjectNode();
-                msg.put("role", "assistant"); msg.put("content", full.toString());
+                msg.put("role", "assistant");
+                if (full.length() > 0) {
+                    msg.put("content", full.toString());
+                } else {
+                    msg.putNull("content");
+                }
+                if (!toolCalls.isEmpty()) {
+                    ArrayNode calls = objectMapper.createArrayNode();
+                    toolCalls.values().forEach(calls::add);
+                    msg.set("tool_calls", calls);
+                }
                 ch.set("message", msg);
-                ch.put("finish_reason", "stop");
+                ch.put("finish_reason", !toolCalls.isEmpty() ? "tool_calls" : finishReason[0]);
                 choices.add(ch);
                 out.set("choices", choices);
                 ObjectNode usage = objectMapper.createObjectNode();
@@ -212,6 +254,11 @@ public final class OpenAiBridge {
     }
 
     private String extractContent(String dataLine) {
+        QoderDelta delta = extractDelta(dataLine);
+        return delta == null ? null : delta.content();
+    }
+
+    private QoderDelta extractDelta(String dataLine) {
         try {
             JsonNode wrapper = objectMapper.readTree(dataLine);
             String inner = wrapper.path("body").asText("");
@@ -219,12 +266,187 @@ public final class OpenAiBridge {
             JsonNode innerJson = objectMapper.readTree(inner);
             for (JsonNode ch : innerJson.path("choices")) {
                 JsonNode delta = ch.path("delta");
+                String finishReason = ch.path("finish_reason").isNull() || ch.path("finish_reason").isMissingNode()
+                        ? null
+                        : ch.path("finish_reason").asText();
+                JsonNode toolCalls = delta.has("tool_calls") ? delta.path("tool_calls") : null;
+                String content = null;
                 if (delta.has("content") && !delta.path("content").asText().isEmpty()) {
-                    return delta.path("content").asText();
+                    content = delta.path("content").asText();
+                }
+                if (content != null || toolCalls != null || finishReason != null) {
+                    return new QoderDelta(content, toolCalls, finishReason);
                 }
             }
         } catch (Exception ignore) {}
         return null;
+    }
+
+    private String buildPrompt(JsonNode messages) {
+        if (!messages.isArray()) return "";
+        StringBuilder prompt = new StringBuilder();
+        for (JsonNode msg : messages) {
+            String role = msg.path("role").asText("");
+            if ("system".equals(role) || "developer".equals(role)) continue;
+            if ("user".equals(role)) {
+                appendSection(prompt, "User", contentAsText(msg.path("content")));
+            } else if ("assistant".equals(role)) {
+                appendSection(prompt, "Assistant", contentAsText(msg.path("content")));
+                if (msg.path("tool_calls").isArray()) {
+                    for (JsonNode call : msg.path("tool_calls")) {
+                        JsonNode fn = call.path("function");
+                        String tool = fn.path("name").asText("");
+                        String args = fn.path("arguments").asText("");
+                        appendSection(prompt, "Assistant tool call", tool + "(" + args + ")");
+                    }
+                }
+            } else if ("tool".equals(role)) {
+                String label = "Tool result";
+                String callId = msg.path("tool_call_id").asText("");
+                if (!callId.isEmpty()) label += " " + callId;
+                appendSection(prompt, label, contentAsText(msg.path("content")));
+            }
+        }
+        return prompt.toString().trim();
+    }
+
+    private void appendSection(StringBuilder out, String label, String value) {
+        if (value == null || value.isBlank()) return;
+        if (out.length() > 0) out.append("\n\n");
+        out.append(label).append(":\n").append(value);
+    }
+
+    private String contentAsText(JsonNode content) {
+        if (content == null || content.isMissingNode() || content.isNull()) return "";
+        if (content.isTextual()) return content.asText();
+        if (!content.isArray()) return content.toString();
+        StringBuilder out = new StringBuilder();
+        for (JsonNode part : content) {
+            if ("text".equals(part.path("type").asText(""))) {
+                if (out.length() > 0) out.append("\n");
+                out.append(part.path("text").asText(""));
+            }
+        }
+        return out.toString();
+    }
+
+    private Set<String> collectToolNames(JsonNode tools) {
+        Set<String> names = new HashSet<>();
+        if (!tools.isArray()) return names;
+        for (JsonNode tool : tools) {
+            String name = tool.path("function").path("name").asText("");
+            if (!name.isEmpty()) names.add(name);
+        }
+        return names;
+    }
+
+    private ArrayNode normalizeToolCalls(JsonNode toolCalls, Set<String> availableTools) {
+        ArrayNode normalized = objectMapper.createArrayNode();
+        for (JsonNode toolCall : toolCalls) {
+            ObjectNode copy = toolCall.deepCopy();
+            if (copy.has("id") && copy.path("id").asText("").isEmpty()) {
+                copy.remove("id");
+            }
+            JsonNode function = copy.path("function");
+            if (function instanceof ObjectNode fn && fn.has("name")) {
+                String name = fn.path("name").asText("");
+                if (name.isEmpty()) {
+                    fn.remove("name");
+                } else {
+                    fn.put("name", mapToolName(name, availableTools));
+                }
+            }
+            normalized.add(copy);
+        }
+        return normalized;
+    }
+
+    private String mapToolName(String name, Set<String> availableTools) {
+        if ("Bash".equals(name) && availableTools.contains("RunCommand")) return "RunCommand";
+        if ("BashOutput".equals(name) && availableTools.contains("CheckCommandStatus")) return "CheckCommandStatus";
+        if ("KillBash".equals(name) && availableTools.contains("StopCommand")) return "StopCommand";
+        return name;
+    }
+
+    private void appendToolCalls(Map<Integer, ObjectNode> toolCalls, JsonNode fragments, Set<String> availableTools) {
+        if (!fragments.isArray()) return;
+        for (JsonNode fragment : fragments) {
+            int index = fragment.path("index").asInt(toolCalls.size());
+            ObjectNode target = toolCalls.computeIfAbsent(index, k -> {
+                ObjectNode n = objectMapper.createObjectNode();
+                n.put("index", k);
+                n.put("type", "function");
+                n.set("function", objectMapper.createObjectNode());
+                return n;
+            });
+            String id = fragment.path("id").asText("");
+            if (!id.isEmpty()) target.put("id", id);
+            String type = fragment.path("type").asText("");
+            if (!type.isEmpty()) target.put("type", type);
+            JsonNode fn = fragment.path("function");
+            if (fn.isObject()) {
+                ObjectNode targetFn = (ObjectNode) target.path("function");
+                String name = fn.path("name").asText("");
+                if (!name.isEmpty()) targetFn.put("name", mapToolName(name, availableTools));
+                if (fn.has("arguments")) {
+                    targetFn.put("arguments", targetFn.path("arguments").asText("") + fn.path("arguments").asText(""));
+                }
+            }
+        }
+    }
+
+    private void logOpenAiRequest(JsonNode req, String model, boolean stream, JsonNode messages) {
+        int messageCount = messages.isArray() ? messages.size() : 0;
+        int toolCount = req.path("tools").isArray() ? req.path("tools").size() : 0;
+        String toolChoice = req.has("tool_choice") ? req.path("tool_choice").toString() : "<missing>";
+        System.out.println("[debug] openai request model=" + model + " stream=" + stream
+                + " messages=" + messageCount + " tools=" + toolCount + " tool_choice=" + toolChoice);
+        if (messages.isArray()) {
+            for (int i = 0; i < messages.size(); i++) {
+                JsonNode msg = messages.get(i);
+                System.out.println("[debug] openai msg[" + i + "] role=" + msg.path("role").asText("")
+                        + " has_tool_calls=" + msg.has("tool_calls")
+                        + " tool_call_id=" + msg.path("tool_call_id").asText(""));
+            }
+        }
+        if (req.path("tools").isArray()) {
+            for (int i = 0; i < req.path("tools").size(); i++) {
+                JsonNode tool = req.path("tools").get(i);
+                System.out.println("[debug] openai tool[" + i + "] type=" + tool.path("type").asText("")
+                        + " name=" + tool.path("function").path("name").asText(""));
+            }
+        }
+        if (DEBUG) {
+            logJson("[debug] openai request body=", req);
+        }
+    }
+
+    private void logQoderSseData(String data, int lineNo) {
+        if (!DEBUG || lineNo > DEBUG_SSE_LINES) return;
+        try {
+            JsonNode wrapper = objectMapper.readTree(data);
+            String inner = wrapper.path("body").asText("");
+            System.out.println("[debug] qoder sse[" + lineNo + "] wrapper=" + truncate(objectMapper.writeValueAsString(wrapper)));
+            if (!inner.isEmpty()) {
+                JsonNode innerJson = objectMapper.readTree(inner);
+                logJson("[debug] qoder sse[" + lineNo + "] body=", innerJson);
+            }
+        } catch (Exception e) {
+            System.out.println("[debug] qoder sse[" + lineNo + "] raw=" + truncate(data));
+        }
+    }
+
+    private void logJson(String prefix, JsonNode json) {
+        try {
+            System.out.println(prefix + truncate(objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(json)));
+        } catch (Exception e) {
+            System.out.println(prefix + truncate(json.toString()));
+        }
+    }
+
+    private String truncate(String value) {
+        if (value == null || value.length() <= DEBUG_MAX_CHARS) return value;
+        return value.substring(0, DEBUG_MAX_CHARS) + "...<truncated>";
     }
 
     private ObjectNode makeChunk(String id, long created, String model) {
