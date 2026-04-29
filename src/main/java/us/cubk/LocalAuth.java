@@ -22,7 +22,12 @@ public final class LocalAuth {
     }
 
     public static String readMachineId() throws Exception {
-        return new String(Files.readAllBytes(defaultDir().resolve("id")), StandardCharsets.UTF_8).trim();
+        Path dir = defaultDir();
+        Path id = dir.resolve("id");
+        if (!Files.exists(id)) {
+            id = dir.resolve("machine_id");
+        }
+        return new String(Files.readAllBytes(id), StandardCharsets.UTF_8).trim();
     }
 
     public static JsonNode readUserInfo() throws Exception {
